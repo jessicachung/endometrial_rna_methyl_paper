@@ -1,0 +1,278 @@
+---
+title: "RNA-seq variance explained"
+author: "Jessica Chung"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+    toc_depth: 4
+    df_print: paged
+---
+
+
+```{r include=FALSE}
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=TRUE, message=TRUE, error=TRUE, echo=TRUE, results="hold")
+knitr::opts_knit$set(root.dir = "..")
+options(digits=4)
+options(width=120)
+```
+
+# Load
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(here)
+library(janitor)
+library(limma)
+library(edgeR)
+library(mgcv)
+```
+
+```{r}
+GSE234354_counts <- readRDS(here("data/GSE234354_counts.rds"))
+GSE234354_phenotype <- readRDS(here("data/GSE234354_phenotype.rds"))
+GSE234354_gene_annotations <- readRDS(here("data/GSE234354_gene_annotations.rds"))
+methyl_phenotype <- readRDS(here("data/methyl_phenotype_with_cell_props.rds"))
+```
+
+```{r}
+rwh_phenotype <- methyl_phenotype %>% filter(! is.na(sample_id), ! is.na(ever_pregnant))
+```
+
+
+# Prepare counts
+
+For visualisation purposes, remove batch effect
+
+```{r}
+exprs <- GSE234354_counts[GSE234354_gene_annotations$ensembl_id,rwh_phenotype$sample_id]
+ok <- rowMeans(cpm(exprs) > 0.5) > 0.2
+# table(ok)
+gene_annotation <- GSE234354_gene_annotations[ok,]
+
+y <- DGEList(GSE234354_counts[gene_annotation$ensembl_id,rwh_phenotype$sample_id], 
+             genes=gene_annotation)
+y <- calcNormFactors(y)
+nc <- cpm(y, log=TRUE)
+```
+
+```{r}
+covariates <- model.matrix(~ rna_batch, data=rwh_phenotype)
+nc_bc <- limma::removeBatchEffect(nc, covariates=covariates[,-1])
+
+# # Functionally the same as using the batch argument, but intercept for each 
+# # gene is slightly different
+# nc_bc <- limma::removeBatchEffect(nc, batch=rwh_phenotype$rna_batch)
+```
+
+-----
+
+# PCA
+
+```{r}
+pca <- prcomp(t(nc_bc[,rwh_phenotype$sample_id]))
+dat <- cbind(rwh_phenotype, pca$x[,1:5])
+```
+
+```{r}
+head(pca$sdev^2 / sum(pca$sdev^2), 10)
+```
+
+```{r}
+ggplot(dat, aes(x=PC1, y=PC2, colour=time)) +
+  geom_point() +
+  scale_colour_gradientn(limits=c(0,100), colors=rainbow(20)[2:19], name="Cycle Time") +
+  theme_bw()
+```
+
+```{r}
+X <- cSplineDes(rwh_phenotype$time, knots=seq(0, 100, length=10))[,-9]
+covariates <- model.matrix(~ X)
+nc_cc <- limma::removeBatchEffect(nc_bc, covariates=covariates[,-1])
+```
+
+```{r}
+pca <- prcomp(t(nc_cc[,rwh_phenotype$sample_id]))
+dat <- cbind(rwh_phenotype, pca$x[,1:5])
+```
+
+```{r}
+head(pca$sdev^2 / sum(pca$sdev^2), 10)
+```
+
+```{r}
+ggplot(dat, aes(x=PC1, y=PC2, colour=cl_epithelial)) +
+  geom_point() +
+  scale_colour_gradientn(colors=topo.colors(20)[5:20]) +
+  theme_bw()
+```
+
+
+-----
+
+# Variance explained
+
+## Model 0
+
+```{r}
+mod_0 <- lm(t(nc_bc) ~ cycle_phase, data=rwh_phenotype)
+mod_0_r2 <- t(sapply(summary(mod_0), \(x) {c(r.squared=x$r.squared, adj.r.squared=x$adj.r.squared)}))
+mean(mod_0_r2[,2])
+```
+
+
+## Model 1
+
+```{r}
+X <- cSplineDes(rwh_phenotype$time, knots=seq(0, 100, length=10))[,-9]
+mod_1 <- lm(t(nc_bc) ~ X, data=rwh_phenotype)
+mod_1_r2 <- t(sapply(summary(mod_1), \(x) {c(r.squared=x$r.squared, adj.r.squared=x$adj.r.squared)}))
+mean(mod_1_r2[,2])
+```
+
+## Model 2
+
+```{r}
+mod_2 <- lm(t(nc_bc) ~ cl_epithelial + cl_immune + cl_mesenchymal, data=rwh_phenotype)
+mod_2_r2 <- t(sapply(summary(mod_2), \(x) {c(r.squared=x$r.squared, adj.r.squared=x$adj.r.squared)}))
+mean(mod_2_r2[,2])
+```
+
+## Model 3
+
+```{r}
+X <- cSplineDes(rwh_phenotype$time, knots=seq(0, 100, length=10))[,-9]
+mod_3 <- lm(t(nc_bc) ~ X + cl_epithelial + cl_immune + cl_mesenchymal, data=rwh_phenotype)
+mod_3_r2 <- t(sapply(summary(mod_3), \(x) {c(r.squared=x$r.squared, adj.r.squared=x$adj.r.squared)}))
+mean(mod_3_r2[,2])
+```
+
+## Compare models
+
+```{r}
+r2_df <- data.frame(mod_0=mod_0_r2[,"r.squared"],
+                    mod_1=mod_1_r2[,"r.squared"],
+                    mod_2=mod_2_r2[,"r.squared"],
+                    mod_3=mod_3_r2[,"r.squared"])
+rownames(r2_df) <- rownames(nc)
+r2_df[1:5,]
+```
+
+```{r}
+colMeans(r2_df)
+```
+
+```{r}
+apply(r2_df, 1, which.max) %>% table()
+```
+
+```{r}
+adj_r2_df <- data.frame(mod_0=mod_0_r2[,"adj.r.squared"],
+                        mod_1=mod_1_r2[,"adj.r.squared"],
+                        mod_2=mod_2_r2[,"adj.r.squared"],
+                        mod_3=mod_3_r2[,"adj.r.squared"])
+rownames(adj_r2_df) <- rownames(nc)
+adj_r2_df[1:5,]
+```
+
+```{r}
+colMeans(adj_r2_df)
+```
+
+
+```{r}
+apply(adj_r2_df, 1, which.max) %>% table()
+```
+
+
+```{r}
+dat <- adj_r2_df %>% rownames_to_column("gene_id") %>%
+  pivot_longer(cols=mod_0:mod_3, names_to="model", values_to="adj_R_squared")
+```
+
+```{r}
+ggplot(dat, aes(x=model, y=adj_R_squared)) +
+  geom_boxplot(outlier.shape=NA) +
+  scale_y_continuous(breaks=seq(0,1,by=0.2)) +
+  theme_bw() +
+  labs(title="Adjusted R-squared from RNA-seq (19k genes)")
+```
+
+
+# Output
+
+## R2 stats
+
+```{r}
+mod_summary <- data.frame(mean=apply(r2_df, 2, mean),
+                     t(apply(r2_df, 2, quantile, c(0.05, 0.25, 0.5, 0.75, 0.95)))) %>%
+  round(4)
+mod_summary
+```
+
+```{r}
+colnames(mod_summary) <- colnames(mod_summary) %>% 
+  str_replace("\\.$", "_percentile") %>%
+  str_remove("^X")
+models <- c("~ cycle_phase",
+            "~ cycle_time",
+            "~ cell_lineages",
+            "~ cycle_time + cell_lineages")
+mod_summary$model_covariates <- models
+```
+
+```{r}
+mod_summary
+```
+
+```{r}
+write.table(mod_summary, file=here("outputs/rna_var_explained_r2.tsv"), sep="\t",
+            quote=FALSE, row.names=FALSE)
+```
+
+## Adj R2 stats
+
+```{r}
+mod_summary <- data.frame(mean=apply(adj_r2_df, 2, mean),
+                     t(apply(adj_r2_df, 2, quantile, c(0.05, 0.25, 0.5, 0.75, 0.95)))) %>%
+  round(4)
+mod_summary
+```
+
+```{r}
+colnames(mod_summary) <- colnames(mod_summary) %>% 
+  str_replace("\\.$", "_percentile") %>%
+  str_remove("^X")
+models <- c("~ cycle_phase",
+            "~ cycle_time",
+            "~ cell_lineages",
+            "~ cycle_time + cell_lineages")
+mod_summary$model_covariates <- models
+```
+
+```{r}
+mod_summary
+```
+
+```{r}
+write.table(mod_summary, file=here("outputs/rna_var_explained_adj_r2.tsv"), sep="\t",
+            quote=FALSE, row.names=FALSE)
+```
+
+-----
+
+# Session Info
+
+```{r}
+if (nzchar(system.file(package="devtools"))) {
+  devtools::session_info()
+} else {
+  sessionInfo()
+}
+```

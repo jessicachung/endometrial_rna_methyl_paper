@@ -1,0 +1,185 @@
+---
+title: "Data wrangling"
+author: "Jessica Chung"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+    toc_depth: 4
+    df_print: paged
+---
+
+
+```{r include=FALSE}
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=TRUE, message=TRUE, error=TRUE, echo=TRUE, results="hold")
+knitr::opts_knit$set(root.dir = "..")
+options(digits=4)
+options(width=120)
+```
+
+# Load
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(here)
+library(janitor)
+library(endest)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(edgeR)
+library(DMRcate)
+select <- dplyr::select
+rename <- dplyr::rename
+```
+
+```{r}
+GSE223817_pdata <- readRDS(here("data/GSE223817_pdata.rds"))
+GSE223817_m_values <- readRDS(here("data/GSE223817_m.rds"))
+```
+
+```{r}
+GSE234354_phenotype <- readRDS(here("data/GSE234354_phenotype.rds"))
+GSE234354_counts <- readRDS(here("data/GSE234354_counts.rds"))
+```
+
+```{r}
+rwh_phenotype_info <- read.table(here("data/rwh_phenotype_info.tsv"), sep="\t",
+                                 header=TRUE) %>%
+  mutate(plate=as.character(plate),
+         sentrix_id=as.character(sentrix_id))
+```
+
+-----
+
+# Tidy GSE223817 pdata
+
+```{r}
+methyl_sample_info <- GSE223817_pdata %>% clean_names()
+methyl_sample_info <- methyl_sample_info %>% select(geo_accession, batch_ch1:terminus_ch1)
+colnames(methyl_sample_info) <- str_remove(colnames(methyl_sample_info), "_ch1$")
+methyl_sample_info <- methyl_sample_info %>% select(-sample_type, -gender)
+```
+
+```{r}
+methyl_sample_info
+```
+
+
+-----
+
+# Merge metadata from GEO with RWH data
+
+```{r}
+methyl_phenotype <- full_join(methyl_sample_info, rwh_phenotype_info, by=join_by(sentrix_id, terminus, plate))
+```
+
+```{r}
+methyl_phenotype
+```
+
+-----
+
+# Estimate cycle time for RNA-seq data
+
+```{r}
+endest_results <- estimate_cycle_time(GSE234354_counts)
+```
+
+
+```{r}
+methyl_phenotype <- methyl_phenotype %>%
+  mutate(time=endest_results$estimated_time[sample_id]) %>%
+  select(geo_accession:sample_id, time, everything())
+```
+
+-----
+
+# Get gene annotations
+
+```{r}
+y <- DGEList(GSE234354_counts)
+y <- calcNormFactors(y)
+ok <- rowMeans(cpm(y) > 0.5) > 0.2
+table(ok)
+```
+
+```{r}
+y <- y[ok, , keep.lib.sizes=FALSE]
+```
+
+```{r}
+# Get Ensembl IDs in expression data
+ensembl_ids <- rownames(y)
+length(ensembl_ids)
+
+# Get gene info from org.Hs.eg.db
+# columns(org.Hs.eg.db)
+cols <- c("SYMBOL", "ENTREZID", "GENENAME")
+annotation <- AnnotationDbi::select(org.Hs.eg.db, keys=ensembl_ids, columns=cols, keytype="ENSEMBL")
+```
+
+```{r}
+# Remove genes without symbols
+annotation <- annotation %>% filter(! is.na(annotation$SYMBOL))
+dim(annotation)
+
+# Show duplicates
+# annotation %>% filter(ENSEMBL %in% annotation[duplicated(annotation$ENSEMBL),"ENSEMBL"])
+
+# Take the first row if duplicate annotations
+annotation <- annotation[!duplicated(annotation$ENSEMBL),]
+dim(annotation)
+```
+
+```{r}
+annotation <- annotation %>% clean_names() %>%
+  rename(ensembl_id="ensembl",
+         entrez_id="entrezid",
+         gene_name="genename")
+```
+
+-----
+
+# Subset RWH M values
+
+Save the smaller matrix of RWH samples with RNA-seq data and filtered probes
+to save memory when loading in data in downstream analyses.
+
+```{r}
+rwh_subset <- methyl_phenotype %>% filter(! is.na(sample_id))
+rwh_m_values <- rmSNPandCH(GSE223817_m_values[,rwh_subset$geo_accession])
+```
+
+```{r}
+dim(rwh_m_values)
+```
+
+
+-----
+
+# Save data
+
+```{r}
+saveRDS(methyl_phenotype, file=here("data/methyl_phenotype.rds"))
+saveRDS(annotation, file=here("data/GSE234354_gene_annotations.rds"))
+saveRDS(rwh_m_values, file=here("cache/rwh_m_values.rds"))
+```
+
+-----
+
+# Session Info
+
+```{r}
+if (nzchar(system.file(package="devtools"))) {
+  devtools::session_info()
+} else {
+  sessionInfo()
+}
+```
+

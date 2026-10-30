@@ -1,0 +1,463 @@
+---
+title: "Methylation analysis"
+author: "Jessica Chung"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+    toc_depth: 4
+    df_print: paged
+---
+
+
+```{r include=FALSE}
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=TRUE, message=TRUE, error=TRUE, echo=TRUE, results="hold")
+knitr::opts_knit$set(root.dir = "..")
+options(digits=4)
+options(width=120)
+```
+
+
+# Settings
+
+```{r}
+cache_dir <- here::here("cache/")
+output_dir <- here::here("outputs/")
+
+analysis_name <- "m0"
+formula <- "~ ever_pregnant + age_scaled + plate"
+# 
+# analysis_name <- "m1"
+# formula <- "~ ever_pregnant + age_scaled + X + plate"
+# 
+# analysis_name <- "m2"
+# formula <- "~ ever_pregnant + age_scaled + cl_epithelial + cl_immune + cl_endothelial + plate"
+# 
+# analysis_name <- "m3"
+# formula <- "~ ever_pregnant + age_scaled + X + cl_epithelial + cl_immune + cl_endothelial + plate"
+```
+
+-----
+
+# Load
+
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(here)
+library(janitor)
+library(limma)
+library(edgeR)
+library(mgcv)
+library(DMRcate)
+library(missMethyl)
+select <- dplyr::select
+```
+
+```{r}
+GSE234354_counts <- readRDS(here("data/GSE234354_counts.rds"))
+GSE234354_phenotype <- readRDS(here("data/GSE234354_phenotype.rds"))
+GSE234354_gene_annotations <- readRDS(here("data/GSE234354_gene_annotations.rds"))
+methyl_phenotype <- readRDS(here("data/methyl_phenotype_with_cell_props.rds"))
+m_values <- readRDS(here("cache/rwh_m_values.rds"))
+all_m_values <- readRDS(here("data/GSE223817_m.rds"))
+filtered_probe_info <- readRDS(here("cache/filtered_probe_info_epic_v1.rds"))
+```
+
+```{r}
+phenotype <- methyl_phenotype
+rwh_phenotype <- methyl_phenotype %>% filter(! is.na(sample_id))
+```
+
+
+```{r}
+table(filtered_probe_info$region)
+region_order <- c("TSS1500", "TSS200", "5'UTR", "1stExon", "Body", "ExonBnd", "3'UTR", "Intronic", "Intergenic")
+region_order_v2 <- c("TSS1500", "TSS200", "5UTR", "exon_1", "exon_2+", "3UTR", "intronic", "intergenic")
+```
+
+
+```{r}
+table(filtered_probe_info$island)
+island_order <- c("Island", "N_Shore", "S_Shore", "N_Shelf", "S_Shelf", "OpenSea")
+island_order_v2 <- c("Island", "Shore", "Shelf", "OpenSea")
+```
+
+
+```{r}
+sig_summary <- function(df, threshold=0.05, stat="num") {
+  x <- df %>% filter(adj.P.Val < threshold) %>% pull(logFC)
+  if (length(x) == 0) return(NULL)
+  if (stat == "num") {
+    return(c("all" = length(x), "neg" = sum(x < 0), "pos" = sum(x > 0)))
+  } else {
+    return(c("all" = length(x)/nrow(df), "neg" = sum(x < 0)/nrow(df), "pos" = sum(x > 0)/nrow(df)))
+  }
+}
+```
+
+```{r}
+probe_group_stats <- function(top_list, group="region", stat="num") {
+  if (group == "region") {
+    df <- cbind(top_list,
+                filtered_probe_info[match(rownames(top_list), filtered_probe_info$probe_id),]) %>%
+      mutate(region=ifelse(str_detect(region, "exon_") & region != "exon_1",
+                          "exon_2+", region)) %>%
+      group_by(region)
+  }
+  if (group == "regulatory_feature_group") {
+    df <- cbind(top_list,
+                filtered_probe_info[match(rownames(top_list), filtered_probe_info$probe_id),]) %>%
+      group_by(regulatory_feature_group)
+  }
+  if (stat == "num") {
+    df <- df %>% summarise(n=n(), 
+                     n_sig=sum(adj.P.Val < 0.05),
+                     n_up=sum(adj.P.Val < 0.05 & logFC > 0),
+                     n_down=sum(adj.P.Val < 0.05 & logFC < 0))
+  }
+  if (stat == "prop") {
+    df <- df %>% summarise(n=n(), 
+                     n_sig=sum(adj.P.Val < 0.05),
+                     n_up=sum(adj.P.Val < 0.05 & logFC > 0),
+                     n_down=sum(adj.P.Val < 0.05 & logFC < 0)) %>%
+      mutate(p_sig=n_sig/n,
+             p_up=n_up/n_sig,
+             p_down=n_down/n_sig) %>%
+      select(-starts_with("n_"))
+  }
+  return(df)
+}
+```
+
+
+```{r}
+probe_region_sig <- function(top_list, region_order) {
+  df <- cbind(top_list,
+              filtered_probe_info[match(rownames(top_list), filtered_probe_info$probe_id),]) %>%
+    mutate(region=ifelse(str_detect(region, "exon_") & region != "exon_1",
+                         "exon_2+", region)) %>%
+    group_by(region) %>% 
+    summarise(n=n(), 
+              n_sig=sum(adj.P.Val < 0.05),
+              n_not_sig=sum(adj.P.Val >= 0.05),
+              n_up=sum(adj.P.Val < 0.05 & logFC > 0),
+              n_down=sum(adj.P.Val < 0.05 & logFC < 0))
+    total_sig <- sum(df$n_sig)
+    df <- df %>% mutate(p_n=n/nrow(top_list),
+           p_sig=n_sig/total_sig,
+           p_up=n_up/total_sig,
+           p_down=n_down/total_sig) %>%
+    select(-starts_with("n_"))
+  df <- df[match(region_order, df$region),]
+  return(df)
+}
+```
+
+```{r}
+plot_probe_region_sig <- function(top_list, region_order) {
+  df <- probe_region_sig(top_list, region_order)
+  
+  dat <- pivot_longer(df, cols=starts_with("p"), names_to="subgroup", values_to="prop") %>%
+    select(-n) %>%
+    # filter(subgroup != "p_sig") %>%
+    mutate(group=ifelse(subgroup != "p_n", "Significant sites", "All analysed sites")) %>%
+    mutate(p=prop * 100)
+  
+  # Kinda hacky... instead of plotting p_up and p_down, plot p_sig and p_down with p_down on top of p_sig
+  dat <- dat %>% 
+    filter(subgroup != "p_up") %>%
+    mutate(subgroup = case_when(
+      subgroup == "p_n" ~ "Analysed sites",
+      subgroup == "p_down" ~ "Significant hypomethylated sites",
+      TRUE ~ "Significant hypermethylated sites"
+    ))
+  dat$region <- factor(dat$region, levels=region_order)
+  
+  g <- ggplot(dat, aes(x=region, y=p, fill=subgroup, group=group)) +
+    geom_histogram(stat="identity", position="dodge") +
+    theme_bw() +
+    labs(x="Genomic Region", y="Methylation Sites (%)") +
+    theme(legend.title=element_blank(),
+          panel.grid=element_blank())
+  return(g)
+}
+```
+
+```{r}
+probe_island_sig <- function(top_list, island_order) {
+  df <- cbind(top_list,
+              filtered_probe_info[match(rownames(top_list), filtered_probe_info$probe_id),]) %>%
+    group_by(island) %>% 
+    summarise(n=n(), 
+              n_sig=sum(adj.P.Val < 0.05),
+              n_not_sig=sum(adj.P.Val >= 0.05),
+              n_up=sum(adj.P.Val < 0.05 & logFC > 0),
+              n_down=sum(adj.P.Val < 0.05 & logFC < 0))
+    total_sig <- sum(df$n_sig)
+    df <- df %>% mutate(p_n=n/nrow(top_list),
+           p_sig=n_sig/total_sig,
+           p_up=n_up/total_sig,
+           p_down=n_down/total_sig) %>%
+    select(-starts_with("n_"))
+  df <- df[match(island_order, df$island),]
+  return(df)
+}
+```
+
+
+```{r}
+plot_probe_island_sig <- function(top_list, island_order) {
+  df <- probe_island_sig(top_list, island_order)
+  
+  dat <- pivot_longer(df, cols=starts_with("p"), names_to="subgroup", values_to="prop") %>%
+    select(-n) %>%
+    # filter(subgroup != "p_sig") %>%
+    mutate(group=ifelse(subgroup != "p_n", "Significant sites", "All analysed sites")) %>%
+    mutate(p=prop * 100)
+  
+  # Kinda hacky... instead of plotting p_up and p_down, plot p_sig and p_down with p_down on top of p_sig
+  dat <- dat %>% 
+    filter(subgroup != "p_up") %>%
+    mutate(subgroup = case_when(
+      subgroup == "p_n" ~ "Analysed sites",
+      subgroup == "p_down" ~ "Significant hypomethylated sites",
+      TRUE ~ "Significant hypermethylated sites"
+    ))
+  dat$island <- factor(dat$island, levels=island_order)
+  
+  g <- ggplot(dat, aes(x=island, y=p, fill=subgroup, group=group)) +
+    geom_histogram(stat="identity", position="dodge") +
+    theme_bw() +
+    labs(x="Methylation site region", y="Methylation Sites (%)") +
+    theme(legend.title=element_blank(),
+          panel.grid=element_blank())
+  return(g)
+}
+```
+
+
+# Filtering
+
+```{r}
+m_values <- m_values[filtered_probe_info$probe_id,]
+```
+
+```{r}
+dim(m_values)
+```
+
+```{r}
+rwh_pheno <- phenotype %>% filter(! is.na(sample_id))
+rwh_pheno
+```
+
+```{r}
+stopifnot(colnames(m_values) == rwh_pheno$geo_accession)
+colnames(m_values) <- rwh_pheno$sample_id
+```
+
+-----
+
+# DMR
+
+
+```{r}
+pheno <- rwh_pheno %>%
+  mutate(age_scaled=scale(age)[,1]) %>%
+  mutate(cycle=case_when(
+    time < 9 | time > 99 ~ "men",
+    time < 59 ~ "pro",
+    TRUE ~ "sec"
+  ))  %>% 
+  filter(! is.na(ever_pregnant)) %>%
+  mutate(group=paste0(cycle, "_", ever_pregnant))
+```
+
+```{r}
+X <- cSplineDes(pheno$time, knots=seq(0, 100, length=4))[,-3]
+```
+
+```{r}
+f <- as.formula(formula)
+design <- model.matrix(f, pheno)
+# head(design)
+```
+
+### Ever pregnant
+
+```{r}
+myannotation <- cpg.annotate("array", object=m_values[,pheno$sample_id], 
+                             what = "M", arraytype = "EPICv1", analysis.type="differential",
+                             design=design, coef="ever_pregnant", fdr=0.01)
+dmr_ever_pregnant <- dmrcate(myannotation, lambda=1000, C=2)
+dmr_ever_pregnant_ranges <- extractRanges(dmr_ever_pregnant, genome = "hg19")
+```
+
+
+```{r}
+dmr_ever_pregnant_ranges %>% head()
+```
+
+```{r}
+dmr_ever_pregnant_ranges@seqnames %>% length
+```
+
+```{r}
+out_df <- as.data.frame(dmr_ever_pregnant_ranges)
+```
+
+```{r}
+saveRDS(dmr_ever_pregnant_ranges, file=paste(cache_dir, analysis_name, "_dmr_ever_pregnant_ranges.rds", sep=""))
+write.table(out_df, file=paste(output_dir, analysis_name, "_dmr_ever_pregnant_ranges.tsv", sep=""),
+            row.names=FALSE, sep="\t", quote=FALSE)
+```
+
+
+
+```{r}
+cols <- ifelse(pheno$ever_pregnant == 1, "forestgreen", "darkred")
+names(cols) <- ifelse(pheno$ever_pregnant == 1, "previous pregnancy", "never pregnant")
+DMR.plot(dmr_ever_pregnant_ranges, dmr = 1, CpGs=m_values[,pheno$sample_id], what = "M", arraytype="EPICv1", 
+         phen.col=cols, genome="hg19", heatmap=FALSE, flank=1000)
+```
+
+```{r}
+DMR.plot(dmr_ever_pregnant_ranges, dmr = 2, CpGs=m_values[,pheno$sample_id], what = "M", arraytype="EPICv1", 
+         phen.col=cols, genome="hg19", heatmap=FALSE, flank=1000)
+```
+
+
+```{r}
+DMR.plot(dmr_ever_pregnant_ranges, dmr = 3, CpGs=m_values[,pheno$sample_id], what = "M", arraytype="EPICv1", 
+         phen.col=cols, genome="hg19", heatmap=FALSE, flank=1000)
+```
+
+
+```{r}
+DMR.plot(dmr_ever_pregnant_ranges, dmr = 4, CpGs=m_values[,pheno$sample_id], what = "M", arraytype="EPICv1", 
+         phen.col=cols, genome="hg19", heatmap=FALSE, flank=1000)
+```
+
+
+```{r}
+DMR.plot(dmr_ever_pregnant_ranges, dmr = 5, CpGs=m_values[,pheno$sample_id], what = "M", arraytype="EPICv1", 
+         phen.col=cols, genome="hg19", heatmap=FALSE, flank=1000)
+```
+
+
+### Age
+
+```{r}
+myannotation <- cpg.annotate("array", object=m_values[,pheno$sample_id], 
+                             what = "M", arraytype = "EPICv1", analysis.type="differential",
+                             design=design, coef="age_scaled", fdr=0.01)
+dmr_age <- dmrcate(myannotation, lambda=1000, C=2)
+dmr_age_ranges <- extractRanges(dmr_age, genome = "hg19")
+```
+
+
+```{r}
+dmr_age_ranges %>% head()
+```
+
+```{r}
+dmr_age_ranges@seqnames %>% length
+```
+
+```{r}
+out_df <- as.data.frame(dmr_age_ranges)
+```
+
+```{r}
+saveRDS(dmr_age_ranges, file=paste(cache_dir, analysis_name, "_dmr_age_ranges.rds", sep=""))
+write.table(out_df, file=paste(output_dir, analysis_name, "_dmr_age_ranges.tsv", sep=""),
+            row.names=FALSE, sep="\t", quote=FALSE)
+```
+
+
+```{r}
+cols <- ifelse(pheno$age < 35, "forestgreen", "darkred")
+names(cols) <- ifelse(pheno$age < 35, "young", "old")
+DMR.plot(dmr_age_ranges, dmr = 1, CpGs=m_values[,pheno$sample_id], what = "M", arraytype="EPICv1", 
+         phen.col=cols, genome="hg19", heatmap=FALSE, flank=1000)
+```
+
+```{r}
+DMR.plot(dmr_age_ranges, dmr = 2, CpGs=m_values[,pheno$sample_id], what = "M", arraytype="EPICv1", 
+         phen.col=cols, genome="hg19", heatmap=FALSE, flank=1000)
+```
+
+```{r}
+DMR.plot(dmr_age_ranges, dmr = 3, CpGs=m_values[,pheno$sample_id], what = "M", arraytype="EPICv1", 
+         phen.col=cols, genome="hg19", heatmap=FALSE, flank=1000)
+```
+
+```{r}
+DMR.plot(dmr_age_ranges, dmr = 4, CpGs=m_values[,pheno$sample_id], what = "M", arraytype="EPICv1", 
+         phen.col=cols, genome="hg19", heatmap=FALSE, flank=1000)
+```
+
+```{r}
+DMR.plot(dmr_age_ranges, dmr = 5, CpGs=m_values[,pheno$sample_id], what = "M", arraytype="EPICv1", 
+         phen.col=cols, genome="hg19", heatmap=FALSE, flank=1000)
+```
+
+-----
+
+# GO Region
+
+### Ever pregnant
+
+```{r}
+dmr_ever_pregnant_ranges_go <- goregion(dmr_ever_pregnant_ranges,
+                                        array.type="EPIC")
+table(dmr_ever_pregnant_ranges_go$FDR < 0.05)
+```
+
+```{r}
+dmr_ever_pregnant_ranges_go %>% arrange(P.DE) %>% head(50)
+```
+
+```{r}
+saveRDS(dmr_ever_pregnant_ranges_go %>% arrange(P.DE), 
+        file=paste(cache_dir, analysis_name, "_dmr_ever_pregnant_ranges_go.rds", sep=""))
+```
+
+
+### Age
+
+```{r}
+dmr_age_ranges_go <- goregion(dmr_age_ranges,
+                              array.type="EPIC")
+table(dmr_age_ranges_go$FDR < 0.05)
+```
+
+```{r}
+dmr_age_ranges_go %>% arrange(P.DE) %>% head(50)
+```
+
+```{r}
+saveRDS(dmr_age_ranges_go %>% arrange(P.DE),
+        file=paste(cache_dir, analysis_name, "_dmr_age_ranges_go.rds", sep=""))
+```
+
+-----
+
+# Session Info
+
+```{r}
+if (nzchar(system.file(package="devtools"))) {
+  devtools::session_info()
+} else {
+  sessionInfo()
+}
+```
+
+

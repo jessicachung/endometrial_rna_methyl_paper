@@ -1,0 +1,196 @@
+---
+title: "RNA cell prop analysis"
+author: "Jessica Chung"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+    toc_depth: 4
+    df_print: paged
+---
+
+
+```{r include=FALSE}
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=TRUE, message=TRUE, error=TRUE, echo=TRUE, results="hold")
+knitr::opts_knit$set(root.dir = "..")
+options(digits=4)
+options(width=120)
+```
+
+# Load
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(janitor)
+library(here)
+library(mgcv)
+library(edgeR)
+library(limma)
+library(endest)
+library(splines)
+```
+
+```{r}
+GSE234354_counts <- readRDS(here("data/GSE234354_counts.rds"))
+GSE234354_gene_annotations <- readRDS(here("data/GSE234354_gene_annotations.rds"))
+phenotype <- readRDS(here("data/methyl_phenotype_with_cell_props.rds"))
+```
+
+
+-----
+
+# Normalise counts
+
+For visualisation purposes, remove batch effect
+
+```{r}
+rwh_phenotype <- phenotype %>% filter(! is.na(sample_id))
+rwh_phenotype <- rwh_phenotype %>% filter(! is.na(ever_pregnant))
+dim(rwh_phenotype)
+```
+
+```{r}
+mean(rwh_phenotype$age)
+table(rwh_phenotype$ever_pregnant)
+```
+
+```{r}
+table(rwh_phenotype$disease_state)
+```
+
+```{r}
+y <- DGEList(GSE234354_counts[GSE234354_gene_annotations$ensembl_id,rwh_phenotype$sample_id])
+y <- calcNormFactors(y)
+nc <- cpm(y, log=TRUE)
+```
+
+```{r}
+covariates <- model.matrix(~ rna_batch, data=rwh_phenotype)
+nc_bc <- limma::removeBatchEffect(nc, covariates=covariates[,-1])
+
+# # Functionally the same as using the batch argument, but intercept for each 
+# # gene is slightly different
+# nc_bc <- limma::removeBatchEffect(nc, batch=rwh_phenotype$rna_batch)
+```
+
+-----
+
+# Plot cell lineages over time
+
+```{r}
+plot_lineage_prop <- function(lineage_name) {
+  g <- ggplot(rwh_phenotype, aes(x=time, y=.data[[lineage_name]])) +
+    geom_point() +
+    theme_bw()
+  return(g)
+}
+```
+
+```{r results="asis"}
+cell_types <- rwh_phenotype %>% select(starts_with("cl")) %>% colnames()
+for (i in 1:length(cell_types)) {
+  cat(sprintf("\n### %s\n\n", cell_types[i]))
+  g <- plot_lineage_prop(cell_types[i]) +
+    scale_x_continuous(breaks=seq(0, 100, 10)) +
+    labs(title=str_remove(cell_types[i], "^cl_"))
+  print(g)
+  cat("\n")
+}
+```
+
+
+-----
+
+# Cell prop vs age
+
+```{r}
+plot_lineage_prop_age <- function(lineage_name) {
+  g <- ggplot(rwh_phenotype, aes(x=time, y=.data[[lineage_name]], color=age)) +
+    geom_point() +
+    theme_bw() +
+    scale_colour_gradientn(colors=hcl.colors(20))
+  return(g)
+}
+```
+
+```{r}
+dat <- rwh_phenotype %>%
+  mutate(age_scaled=scale(age)[,1]) %>%
+  mutate(cycle=case_when(
+    time < 9 | time > 99 ~ "men",
+    time < 59 ~ "pro",
+    TRUE ~ "sec"
+  ))
+```
+
+## Across cycle
+
+```{r results='markup'}
+cell_types <- rwh_phenotype %>% select(starts_with("cl")) %>% colnames()
+for (ct in cell_types) {
+  print(ct)
+  X <- cSplineDes(dat$time, knots=seq(0, 100, length=10))[,-9]
+  lm_res <- lm(as.formula(paste0(ct, " ~ age + X")), data=dat)
+  print(summary(lm_res))
+  g <- plot_lineage_prop_age(ct) +
+    scale_x_continuous(breaks=seq(0, 100, 10)) +
+    labs(title=str_remove(ct, "^ct"))
+  print(g)
+}
+```
+
+## Within cycle stages
+
+```{r results='markup'}
+for (ct in cell_types) {
+  print(ct)
+  X <- cSplineDes(dat$time, knots=seq(0, 100, length=10))[,-9]
+  lm_res <- lm(as.formula(paste0(ct, " ~ age_scaled:cycle + cycle + X")), data=dat)
+  print(summary(lm_res))
+  g <- plot_lineage_prop_age(ct) +
+    scale_x_continuous(breaks=seq(0, 100, 10)) +
+    labs(title=str_remove(ct, "^ct")) +
+    geom_vline(xintercept=8, linetype="dashed", color="red") +
+    geom_vline(xintercept=58, linetype="dashed", color="red")
+  print(g)
+}
+```
+
+
+-----
+
+# Age groups
+
+```{r}
+table(dat$cycle)
+```
+
+
+```{r}
+dat_sec <- dat %>%
+  filter(cycle == "sec") %>%
+  mutate(age_group=ifelse(age < 35, "young", "old"))
+table(dat_sec$age)
+table(dat_sec$age_group)
+X <- ns(dat_sec$time, 5)
+summary(lm(cl_endothelial ~ X + age_group, dat_sec))
+```
+
+
+-----
+
+# Session Info
+
+```{r}
+if (nzchar(system.file(package="devtools"))) {
+  devtools::session_info()
+} else {
+  sessionInfo()
+}
+```

@@ -1,0 +1,268 @@
+---
+title: "Methylation probe filtering and annotation wrangling"
+author: "Jessica Chung"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+    toc_depth: 4
+    df_print: paged
+---
+
+Output both annotation from EPIC v1 (hg19) and EPIC v2 (hg38).
+
+```{r include=FALSE}
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=TRUE, message=TRUE, error=TRUE, echo=TRUE, results="hold")
+knitr::opts_knit$set(root.dir = "..")
+options(digits=4)
+options(width=120)
+```
+
+# Load
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(here)
+library(limma)
+library(edgeR)
+library(mgcv)
+library(janitor)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+library(DMRcate)
+select <- dplyr::select
+```
+
+```{r}
+GSE234354_counts <- readRDS(here("data/GSE234354_counts.rds"))
+GSE234354_gene_annotations <- readRDS(here("data/GSE234354_gene_annotations.rds"))
+m_values <- readRDS(here("cache/rwh_m_values.rds"))
+all_m_values <- readRDS(here("data/GSE223817_m.rds"))
+```
+
+```{r}
+cols <- c("UCSC_RefGene_Name", "UCSC_RefGene_Group", "Regulatory_Feature_Name", "Regulatory_Feature_Group")
+probe_info <- IlluminaHumanMethylationEPICanno.ilm10b4.hg19::Other[, cols] %>% clean_names()
+probe_info <- data.frame(probe_info)
+```
+
+```{r}
+cols <- c("EPICv1_Loci", "UCSC_RefGene_Name", "UCSC_RefGene_Group", "GencodeV41_Name", "Regulatory_Feature_Group")
+probe_info_v2 <- IlluminaHumanMethylationEPICv2anno.20a1.hg38::Other[, cols] %>% clean_names()
+colnames(probe_info_v2)[1] <- "probe_id"
+probe_info_v2 <- data.frame(probe_info_v2)
+```
+
+```{r}
+# Wrangle ucsc_ref_gene_group in probe_info
+# Where multiple groups, use the most common one
+most_common <- function(x) {
+  # Get most common item in vector. If tie, get random most common item.
+  tab <- table(x)
+  tab <- tab[tab == max(tab)]
+  return(names(tab)[sample(length(tab), size=1)])
+}
+
+probe_info$region <- probe_info$ucsc_ref_gene_group %>% 
+  str_split(";") %>%
+  sapply(most_common)
+
+probe_info_v2$region <- probe_info_v2$ucsc_ref_gene_group %>% 
+  str_split(";") %>%
+  sapply(most_common)
+```
+
+
+```{r}
+stopifnot(rownames(IlluminaHumanMethylationEPICanno.ilm10b4.hg19::Locations) == rownames(probe_info))
+probe_info <- cbind(probe_info, IlluminaHumanMethylationEPICanno.ilm10b4.hg19::Locations)
+```
+
+```{r}
+stopifnot(rownames(IlluminaHumanMethylationEPICv2anno.20a1.hg38::Locations) == rownames(probe_info_v2))
+probe_info_v2 <- cbind(probe_info_v2, IlluminaHumanMethylationEPICv2anno.20a1.hg38::Locations)
+```
+
+```{r}
+stopifnot(rownames(IlluminaHumanMethylationEPICanno.ilm10b4.hg19::Islands.UCSC) == rownames(probe_info))
+probe_info$island <- IlluminaHumanMethylationEPICanno.ilm10b4.hg19::Islands.UCSC$Relation_to_Island
+```
+
+```{r}
+stopifnot(rownames(IlluminaHumanMethylationEPICv2anno.20a1.hg38::Islands.UCSC) == rownames(probe_info_v2))
+probe_info_v2$island <- IlluminaHumanMethylationEPICv2anno.20a1.hg38::Islands.UCSC$Relation_to_Island
+```
+
+```{r}
+probe_gene_overlaps <- countOverlaps(
+  GRanges(seqnames=IlluminaHumanMethylationEPICanno.ilm10b4.hg19::Locations$chr,
+               ranges=IRanges(start=IlluminaHumanMethylationEPICanno.ilm10b4.hg19::Locations$pos,
+                              end=IlluminaHumanMethylationEPICanno.ilm10b4.hg19::Locations$pos+1)),
+  transcripts(TxDb.Hsapiens.UCSC.hg19.knownGene)
+)
+probe_info$gene_overlaps <- probe_gene_overlaps
+```
+
+```{r}
+probe_gene_overlaps <- countOverlaps(
+  GRanges(seqnames=IlluminaHumanMethylationEPICv2anno.20a1.hg38::Locations$chr,
+               ranges=IRanges(start=IlluminaHumanMethylationEPICv2anno.20a1.hg38::Locations$pos,
+                              end=IlluminaHumanMethylationEPICv2anno.20a1.hg38::Locations$pos+1)),
+  transcripts(TxDb.Hsapiens.UCSC.hg38.knownGene)
+)
+probe_info_v2$gene_overlaps <- probe_gene_overlaps
+```
+
+```{r}
+probe_exon_overlaps <- countOverlaps(
+  GRanges(seqnames=IlluminaHumanMethylationEPICanno.ilm10b4.hg19::Locations$chr,
+               ranges=IRanges(start=IlluminaHumanMethylationEPICanno.ilm10b4.hg19::Locations$pos,
+                              end=IlluminaHumanMethylationEPICanno.ilm10b4.hg19::Locations$pos+1)),
+  exons(TxDb.Hsapiens.UCSC.hg19.knownGene)
+)
+probe_info$exon_overlaps <- probe_exon_overlaps
+```
+
+```{r}
+probe_exon_overlaps <- countOverlaps(
+  GRanges(seqnames=IlluminaHumanMethylationEPICv2anno.20a1.hg38::Locations$chr,
+               ranges=IRanges(start=IlluminaHumanMethylationEPICv2anno.20a1.hg38::Locations$pos,
+                              end=IlluminaHumanMethylationEPICv2anno.20a1.hg38::Locations$pos+1)),
+  exons(TxDb.Hsapiens.UCSC.hg38.knownGene)
+)
+probe_info_v2$exon_overlaps <- probe_exon_overlaps
+```
+
+```{r}
+probe_info$intronic <- probe_info$exon_overlaps == 0 & probe_info$region == "Body"
+probe_info$intergenic <- probe_info$ucsc_ref_gene_name == ""
+
+table(probe_info$intronic, probe_info$intergenic)
+table(probe_info$intronic, probe_info$region)
+table(probe_info$intergenic, probe_info$region)
+```
+
+```{r}
+probe_info <- probe_info %>%
+  dplyr::rename(original_region="region") %>%
+  mutate(region=case_when(
+           intronic ~ "Intronic",
+           intergenic ~ "Intergenic",
+           TRUE ~ original_region
+         ))
+```
+
+
+
+```{r}
+probe_info_v2$intergenic <- probe_info_v2$gene_overlaps == 0 & probe_info_v2$ucsc_ref_gene_name == ""
+probe_info_v2 <- probe_info_v2 %>% mutate(region=case_when(
+  intergenic ~ "intergenic",
+  region == "" ~ "intronic",
+  TRUE ~ region
+))
+```
+
+```{r}
+probe_info_v2 %>% mutate(region=ifelse(str_detect(region, "exon_") & region != "exon_1", "exon_2+", region)) %>%
+  with(table(region))
+probe_info_v2 %>% mutate(region=ifelse(str_detect(region, "exon_") & region != "exon_1", "exon_2+", region)) %>%
+  with(table(region, island))
+```
+
+```{r}
+probe_info_v2 <- probe_info_v2 %>%
+  mutate(region=ifelse(str_detect(region, "exon_") & region != "exon_1", "exon_2+", region))
+
+# probe_info_v2 %>% filter(region == "intronic")
+```
+
+
+```{r}
+table(probe_info$region)
+table(probe_info_v2$region)
+```
+
+```{r}
+probe_info %>% group_by(region) %>% summarise(n=n(), mean=n()/nrow(.))
+```
+
+```{r}
+probe_info_v2 %>% group_by(region) %>% summarise(n=n(), mean=n()/nrow(.))
+```
+
+
+# Filtering
+
+```{r}
+dim(m_values)
+dim(all_m_values)
+```
+
+
+```{r}
+table(rownames(m_values) %in% rownames(probe_info))
+table(rownames(m_values) %in% probe_info_v2$probe_id)
+```
+
+```{r}
+m <- match(rownames(m_values), rownames(probe_info))
+table(is.na(m))
+```
+
+
+```{r}
+filtered_probe_info <- probe_info[m,]
+filtered_probe_info$probe_id <- rownames(filtered_probe_info)
+filtered_probe_info <- filtered_probe_info %>% select(probe_id, everything())
+dim(filtered_probe_info)
+```
+
+
+```{r}
+saveRDS(filtered_probe_info, here("cache/filtered_probe_info_epic_v1.rds"))
+```
+
+
+
+```{r}
+m_values <- m_values[rownames(m_values) %in% probe_info_v2$probe_id,]
+dim(m_values)
+```
+
+```{r}
+m <- match(rownames(m_values), probe_info_v2$probe_id)
+table(is.na(m))
+```
+
+```{r}
+filtered_probe_info_v2 <- probe_info_v2[m,]
+dim(filtered_probe_info_v2)
+```
+
+
+```{r}
+saveRDS(filtered_probe_info_v2, here("cache/filtered_probe_info_epic_v2.rds"))
+```
+
+
+-----
+
+# Session Info
+
+```{r}
+if (nzchar(system.file(package="devtools"))) {
+  devtools::session_info()
+} else {
+  sessionInfo()
+}
+```
+

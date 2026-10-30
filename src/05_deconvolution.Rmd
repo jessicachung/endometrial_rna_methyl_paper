@@ -1,0 +1,158 @@
+---
+title: "MuSiC deconvolution"
+author: "Jessica Chung"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+    toc_depth: 4
+    df_print: paged
+---
+
+
+```{r include=FALSE}
+# Also need anndata python module
+# $ pip install --user anndata
+
+# Convert to R script
+# knitr::purl(here::here("src/05_deconvolution.Rmd"))
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=TRUE, message=TRUE, error=TRUE, echo=TRUE, results="hold")
+knitr::opts_knit$set(root.dir = "..")
+options(digits=4)
+options(width=120)
+```
+
+
+# Download single cell data
+
+```
+Download the Mareckova & Garcia-Alonso et al 2023 endometrium reference 
+integrated atlas (all cells dataset) from 
+https://www.reproductivecellatlas.org/endometrium_reference.html
+and store as `data/endometriumAtlasV2_cells_with_counts.h5ad`.
+```
+
+-----
+
+# Load
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(here)
+library(janitor)
+library(MuSiC)
+library(Seurat)
+library(SingleCellExperiment)
+library(anndata)
+```
+
+```{r}
+GSE234354_counts <- readRDS(here("data/GSE234354_counts.rds"))
+GSE234354_phenotype <- readRDS(here("data/GSE234354_phenotype.rds"))
+GSE234354_gene_annotations <- readRDS(here("data/GSE234354_gene_annotations.rds"))
+methyl_phenotype <- readRDS(here("data/methyl_phenotype.rds"))
+```
+
+
+-----
+
+# Load in single cell data
+
+```{r}
+cell_lineage_output <- here("cache/rwh_cell_prop_lineage.rds")
+load_data <- ! file.exists(cell_lineage_output)
+```
+
+
+```{r}
+if (load_data) {
+  message("Loading in single cell data")
+  data <- read_h5ad(here("data/endometriumAtlasV2_cells_with_counts.h5ad"))
+  data <- CreateSeuratObject(counts = t(data$X), meta.data = data$obs)
+  gc()
+  data_sce <- as.SingleCellExperiment(data)
+  rm(data)
+  gc() 
+} else {
+  message("Deconvolution already done. Will load files from cache.")  
+}
+```
+
+
+# MuSiC deconvolution on RWH samples
+
+```{r}
+annotation <- GSE234354_gene_annotations[!duplicated(GSE234354_gene_annotations$symbol),]
+dim(annotation)
+```
+
+```{r}
+counts <- GSE234354_counts[annotation$ensembl_id,]
+rownames(counts) <- annotation$symbol
+head(counts, 5:6)
+```
+
+```{r}
+dim(counts)
+```
+
+
+## Lineage
+
+```{r}
+if (file.exists(cell_lineage_output)) {
+  message("Deconvolution already done. Loading results from cache.")
+  est_prop_lineage <- readRDS(cell_lineage_output)
+} else {
+  cell_types <- levels(data_sce$lineage)
+  est_prop_lineage <- music_prop(bulk.mtx = counts, sc.sce = data_sce, clusters = "lineage",
+                                   samples = "sample", select.ct = cell_types, verbose = TRUE)
+  saveRDS(est_prop_lineage, file=cell_lineage_output)
+  gc()
+}
+```
+
+
+-----
+
+# Save phenotype data
+
+
+```{r}
+cell_lineage_df <- data.frame(est_prop_lineage$Est.prop.weighted) %>%
+  clean_names() %>% rownames_to_column("sample_id")
+colnames(cell_lineage_df)[-1] <- paste0("cl_", colnames(cell_lineage_df)[-1])
+
+methyl_phenotype_with_cell_props <- methyl_phenotype %>%
+  left_join(GSE234354_phenotype %>% select(sample_id, batch) %>%
+              dplyr::rename(rna_batch="batch"), by=join_by(sample_id)) %>%
+  left_join(cell_lineage_df, by=join_by(sample_id))
+```
+
+```{r}
+methyl_phenotype_with_cell_props
+```
+
+```{r}
+saveRDS(methyl_phenotype_with_cell_props,
+        file=here("data/methyl_phenotype_with_cell_props.rds"))
+```
+
+
+-----
+
+# Session Info
+
+```{r}
+if (nzchar(system.file(package="devtools"))) {
+  devtools::session_info()
+} else {
+  sessionInfo()
+}
+```

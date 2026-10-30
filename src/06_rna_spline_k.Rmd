@@ -1,0 +1,145 @@
+---
+title: "RNA-seq Spline K"
+author: "Jessica Chung"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+    toc_depth: 4
+    df_print: paged
+---
+
+
+```{r include=FALSE}
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=TRUE, message=TRUE, error=TRUE, echo=TRUE, results="hold")
+knitr::opts_knit$set(root.dir = "..")
+options(digits=4)
+options(width=120)
+```
+
+# Load
+
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(here)
+library(mgcv)
+library(edgeR)
+library(limma)
+library(splines)
+library(janitor)
+
+library(org.Hs.eg.db)
+library(clusterProfiler)
+
+select <- dplyr::select
+```
+
+```{r}
+GSE234354_counts <- readRDS(here("data/GSE234354_counts.rds"))
+GSE234354_gene_annotations <- readRDS(here("data/GSE234354_gene_annotations.rds"))
+phenotype <- readRDS(here("data/methyl_phenotype_with_cell_props.rds"))
+```
+
+
+-----
+
+# Normalise counts
+
+For visualisation purposes, remove batch effect
+
+```{r}
+rwh_phenotype <- phenotype %>% filter(! is.na(sample_id), ! is.na(ever_pregnant))
+exprs <- GSE234354_counts[GSE234354_gene_annotations$ensembl_id,rwh_phenotype$sample_id]
+ok <- rowMeans(cpm(exprs) > 0.5) > 0.2
+table(ok)
+gene_annotation <- GSE234354_gene_annotations[ok,]
+
+y <- DGEList(GSE234354_counts[gene_annotation$ensembl_id,rwh_phenotype$sample_id], 
+             genes=gene_annotation)
+y <- calcNormFactors(y)
+nc <- cpm(y, log=TRUE)
+```
+
+```{r}
+covariates <- model.matrix(~ rna_batch, data=rwh_phenotype)
+nc_bc <- limma::removeBatchEffect(nc, covariates=covariates[,-1])
+
+# # Functionally the same as using the batch argument, but intercept for each 
+# # gene is slightly different
+# nc_bc <- limma::removeBatchEffect(nc, batch=rwh_phenotype$rna_batch)
+```
+
+```{r}
+X <- cSplineDes(rwh_phenotype$time, knots=seq(0, 100, length=10))[,-9]
+covariates <- model.matrix(~ X + rna_batch, data=rwh_phenotype)
+nc_cc <- limma::removeBatchEffect(nc, covariates=covariates[,-1])
+```
+
+```{r}
+cl_names <- rwh_phenotype %>% select(starts_with("cl")) %>% colnames()
+cl_names
+```
+
+-----
+
+
+# Regularised fit
+
+```{r}
+rwh_pheno <- rwh_phenotype
+pheno <- rwh_pheno %>%
+  mutate(age_scaled=scale(age)[,1]) %>%
+  mutate(cycle=case_when(
+    time < 9 | time > 99 ~ "men",
+    time < 59 ~ "pro",
+    TRUE ~ "sec"
+  ))  %>% 
+  filter(! is.na(ever_pregnant)) %>%
+  mutate(group=paste0(cycle, "_", ever_pregnant))
+```
+
+```{r}
+k_knots <- 30
+spline_knots <- list(x=seq(1,100,length=k_knots))
+gamma <- 4
+batch <- pheno$rna_batch
+x <- pheno$time
+
+Sys.time()
+fit_summary_list <- lapply(1:nrow(nc), \(i) {
+  y <- nc[i, pheno$sample_id]
+  fit <- gam(y ~ batch + s(x, bs="cc", k=k_knots, fx=FALSE), knots=spline_knots, gamma=gamma)
+  fit_summary <- summary(fit)
+  return(c(fit_summary$edf, fit_summary$r.sq))
+})
+Sys.time()
+
+edf <- sapply(fit_summary_list, \(x) x[1])
+quantile(edf, c(0.5, 0.9, 0.99, 0.999, 0.9999, 1))
+hist(edf)
+
+```
+
+
+
+-----
+
+# Session Info
+
+```{r}
+if (nzchar(system.file(package="devtools"))) {
+  devtools::session_info()
+} else {
+  sessionInfo()
+}
+```
+
+
+

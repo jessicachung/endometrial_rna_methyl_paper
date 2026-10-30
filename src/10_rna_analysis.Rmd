@@ -1,0 +1,554 @@
+---
+title: "RNA-seq analysis"
+author: "Jessica Chung"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+    toc_depth: 4
+    df_print: paged
+---
+
+
+```{r include=FALSE}
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=TRUE, message=TRUE, error=TRUE, echo=TRUE, results="hold")
+knitr::opts_knit$set(root.dir = "..")
+options(digits=4)
+options(width=120)
+```
+
+
+# Settings
+
+```{r}
+output_dir <- here::here("cache/")
+
+analysis_name <- "m0"
+formula <- "~ ever_pregnant + age_scaled:cycle + cycle + rna_batch"
+formula_full_cycle <- "~ ever_pregnant + age_scaled + rna_batch"
+# 
+# analysis_name <- "m1"
+# formula <- "~ ever_pregnant + age_scaled:cycle + cycle + X + rna_batch"
+# formula_full_cycle <- "~ ever_pregnant + age_scaled + X + rna_batch"
+# 
+# analysis_name <- "m2"
+# formula <- "~ ever_pregnant + age_scaled:cycle + cycle + cl_epithelial + cl_immune + cl_endothelial + rna_batch"
+# formula_full_cycle <- "~ ever_pregnant + age_scaled + cl_epithelial + cl_immune + cl_endothelial + rna_batch"
+# 
+# analysis_name <- "m3"
+# formula <- "~ ever_pregnant + age_scaled:cycle + cycle + X + cl_epithelial + cl_immune + cl_endothelial + rna_batch"
+# formula_full_cycle <- "~ ever_pregnant + age_scaled + X + cl_epithelial + cl_immune + cl_endothelial + rna_batch"
+```
+
+-----
+
+# Load
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(here)
+library(mgcv)
+library(edgeR)
+library(limma)
+library(splines)
+library(janitor)
+
+library(org.Hs.eg.db)
+library(clusterProfiler)
+
+select <- dplyr::select
+```
+
+```{r}
+GSE234354_counts <- readRDS(here("data/GSE234354_counts.rds"))
+GSE234354_gene_annotations <- readRDS(here("data/GSE234354_gene_annotations.rds"))
+phenotype <- readRDS(here("data/methyl_phenotype_with_cell_props.rds"))
+```
+
+-----
+
+# Normalise counts
+
+For visualisation purposes, remove batch effect
+
+```{r}
+rwh_phenotype <- phenotype %>% filter(! is.na(sample_id))
+exprs <- GSE234354_counts[GSE234354_gene_annotations$ensembl_id,rwh_phenotype$sample_id]
+ok <- rowMeans(cpm(exprs) > 0.5) > 0.2
+table(ok)
+gene_annotation <- GSE234354_gene_annotations[ok,]
+
+y <- DGEList(GSE234354_counts[gene_annotation$ensembl_id,rwh_phenotype$sample_id], 
+             genes=gene_annotation)
+y <- calcNormFactors(y)
+nc <- cpm(y, log=TRUE)
+```
+
+```{r}
+covariates <- model.matrix(~ rna_batch, data=rwh_phenotype)
+nc_bc <- limma::removeBatchEffect(nc, covariates=covariates[,-1])
+
+# # Functionally the same as using the batch argument, but intercept for each 
+# # gene is slightly different
+# nc_bc <- limma::removeBatchEffect(nc, batch=rwh_phenotype$rna_batch)
+```
+
+```{r}
+X <- cSplineDes(rwh_phenotype$time, knots=seq(0, 100, length=10))[,-9]
+covariates <- model.matrix(~ X + rna_batch, data=rwh_phenotype)
+nc_cc <- limma::removeBatchEffect(nc, covariates=covariates[,-1])
+```
+
+-----
+
+
+# DGE
+
+```{r}
+y <- DGEList(GSE234354_counts[gene_annotation$ensembl_id,rwh_phenotype$sample_id], 
+             genes=gene_annotation)
+y <- calcNormFactors(y)
+nc <- cpm(y, log=TRUE)
+```
+
+```{r}
+table(rwh_phenotype$ever_pregnant, useNA="always")
+```
+
+```{r}
+pheno <- rwh_phenotype %>%
+  mutate(age_scaled=scale(age)[,1]) %>%
+  mutate(cycle=case_when(
+    time < 9 | time > 99 ~ "men",
+    time < 59 ~ "pro",
+    TRUE ~ "sec"
+  ))  %>% 
+  filter(! is.na(ever_pregnant)) %>%
+  mutate(group=paste0(cycle, "_", ever_pregnant))
+```
+
+```{r}
+table(pheno$ever_pregnant, useNA="always")
+```
+
+```{r}
+table(pheno$ever_pregnant, pheno$cycle, useNA="always")
+```
+
+```{r}
+table(pheno$rna_batch, pheno$group, useNA="always")
+```
+
+## By cycle stage
+
+```{r}
+X <- cSplineDes(pheno$time, knots=seq(0, 100, length=10))[,-9]
+f <- as.formula(formula)
+design <- model.matrix(f, pheno)
+```
+
+```{r}
+v <- voom(y[,pheno$sample_id], design)
+fit <- lmFit(v, design)
+fit <- eBayes(fit, robust=TRUE)
+```
+
+```{r}
+decideTests(fit) %>% abs %>% colSums
+```
+
+```{r}
+top_ever_pregnant <- topTable(fit, coef="ever_pregnant", n=Inf, sort.by="p")
+```
+
+```{r}
+hist(top_ever_pregnant$P.Value, breaks=100)
+```
+
+```{r}
+top_age <- list()
+top_age[["men"]] <- topTable(fit, coef="age_scaled:cyclemen", n=Inf, sort.by="p")
+top_age[["pro"]] <- topTable(fit, coef="age_scaled:cyclepro", n=Inf, sort.by="p")
+top_age[["sec"]] <- topTable(fit, coef="age_scaled:cyclesec", n=Inf, sort.by="p")
+```
+
+```{r}
+hist(top_age[["men"]]$P.Value, breaks=100)
+hist(top_age[["pro"]]$P.Value, breaks=100)
+hist(top_age[["sec"]]$P.Value, breaks=100)
+```
+
+```{r}
+head(top_ever_pregnant)
+head(top_age[["men"]])
+head(top_age[["pro"]])
+head(top_age[["sec"]])
+```
+
+```{r}
+saveRDS(top_ever_pregnant, file=paste(output_dir, analysis_name, "_top_ever_pregnant.rds", sep=""))
+saveRDS(top_age, file=paste(output_dir, analysis_name, "_top_age.rds", sep=""))
+```
+
+
+## Full cycle
+
+Just sanity checking
+
+```{r}
+X <- cSplineDes(pheno$time, knots=seq(0, 100, length=10))[,-9]
+f <- as.formula(formula_full_cycle)
+design <- model.matrix(f, pheno)
+# head(design)
+```
+
+```{r}
+v <- voom(y[,pheno$sample_id], design)
+fit <- lmFit(v, design)
+fit <- eBayes(fit, robust=TRUE)
+```
+
+```{r}
+decideTests(fit) %>% abs %>% colSums
+```
+
+```{r}
+hist(topTable(fit, coef="ever_pregnant", n=Inf)$P.Value, breaks=100)
+```
+
+```{r}
+hist(topTable(fit, coef="age_scaled", n=Inf)$P.Value, breaks=100)
+```
+
+-----
+
+# ORA
+
+```{r}
+run_ora <- function(top_table, run_go=TRUE, run_kegg=FALSE,
+                    run_reactome=FALSE, p_threshold=0.05,
+                    directional=TRUE) {
+  up_de <- top_table %>% filter(adj.P.Val < p_threshold, logFC > 0) %>%
+    pull(entrez_id)
+  down_de <- top_table %>% filter(adj.P.Val < p_threshold, logFC < 0) %>%
+    pull(entrez_id)
+  de <- top_table %>% filter(adj.P.Val < p_threshold) %>%
+    pull(entrez_id)
+  universe <- top_table$entrez_id
+  results <- list()
+  # qvalueCutoff=0.05 argument doesn't work... Filter manually afterwards
+  if (run_go) {
+    if (directional) {
+      results[["up_go"]] <-
+        enrichGO(up_de, OrgDb = "org.Hs.eg.db", ont="all",
+                 universe=universe, readable=TRUE)
+      results[["down_go"]] <-
+        enrichGO(down_de, OrgDb = "org.Hs.eg.db", ont="all",
+                 universe=universe, readable=TRUE)
+    } else {
+      results[["go"]] <-
+        enrichGO(de, OrgDb = "org.Hs.eg.db", ont="all",
+                 universe=universe, readable=TRUE)
+    }
+  }
+  if (run_kegg) {
+    if (directional) {
+      results[["up_kegg"]] <-
+        enrichKEGG(up_de, organism="hsa", universe=universe)
+      results[["down_kegg"]] <-
+        enrichKEGG(down_de, organism="hsa", universe=universe)
+    } else {
+      results[["kegg"]] <-
+        enrichKEGG(de, organism="hsa", universe=universe)
+    }
+  }
+  if (run_reactome) {
+    if (directional) {
+      results[["up_reactome"]] <-
+        enrichPathway(gene=up_de, universe=universe, readable=TRUE)
+      results[["down_reactome"]] <-
+        enrichPathway(gene=down_de, universe=universe, readable=TRUE)
+    } else {
+      results[["reactome"]] <-
+        enrichPathway(gene=de, universe=universe, readable=TRUE)
+    }
+  }
+  return(results)
+}
+```
+
+
+```{r}
+run_ora_top_n <- function(top_table, run_go=TRUE, run_kegg=FALSE,
+                    run_reactome=FALSE, n=100,
+                    directional=TRUE) {
+  up_de <- top_table %>% filter(logFC > 0) %>% arrange(P.Value) %>%
+    pull(entrez_id) %>% head(n)
+  down_de <- top_table %>% filter(logFC < 0) %>% arrange(P.Value) %>%
+    pull(entrez_id) %>% head(n)
+  de <- top_table %>% pull(entrez_id) %>% head(n)
+  universe <- top_table$entrez_id
+  results <- list()
+  # qvalueCutoff=0.05 argument doesn't work... Filter manually afterwards
+  if (run_go) {
+    if (directional) {
+      results[["up_go"]] <-
+        enrichGO(up_de, OrgDb = "org.Hs.eg.db", ont="all",
+                 universe=universe, readable=TRUE)
+      results[["down_go"]] <-
+        enrichGO(down_de, OrgDb = "org.Hs.eg.db", ont="all",
+                 universe=universe, readable=TRUE)
+    } else {
+      results[["go"]] <-
+        enrichGO(de, OrgDb = "org.Hs.eg.db", ont="all",
+                 universe=universe, readable=TRUE)
+    }
+  }
+  if (run_kegg) {
+    if (directional) {
+      results[["up_kegg"]] <-
+        enrichKEGG(up_de, organism="hsa", universe=universe)
+      results[["down_kegg"]] <-
+        enrichKEGG(down_de, organism="hsa", universe=universe)
+    } else {
+      results[["kegg"]] <-
+        enrichKEGG(de, organism="hsa", universe=universe)
+    }
+  }
+  if (run_reactome) {
+    if (directional) {
+      results[["up_reactome"]] <-
+        enrichPathway(gene=up_de, universe=universe, readable=TRUE)
+      results[["down_reactome"]] <-
+        enrichPathway(gene=down_de, universe=universe, readable=TRUE)
+    } else {
+      results[["reactome"]] <-
+        enrichPathway(gene=de, universe=universe, readable=TRUE)
+    }
+  }
+  return(results)
+}
+```
+
+
+### Ever pregnant
+
+```{r}
+top <- top_ever_pregnant
+```
+
+```{r}
+ora_results <- run_ora_top_n(top,
+  run_kegg=TRUE, run_reactome=FALSE, n=100)
+```
+
+```{r}
+sapply(ora_results, function(x) {
+  a <- x@result %>% filter(p.adjust < 0.05) %>% nrow
+  b <- x@geneSets %>% length
+  sprintf("%d/%d", a, b)
+})
+```
+
+```{r}
+ora_results$up_go@result %>% filter(p.adjust < 0.05) %>% head(50)
+```
+
+```{r}
+ora_results$down_go@result %>% filter(p.adjust < 0.05) %>% head(50)
+```
+
+```{r}
+ora_results$up_kegg@result %>% filter(p.adjust < 0.05) %>% head(50)
+```
+
+```{r}
+ora_results$down_kegg@result %>% filter(p.adjust < 0.05) %>% head(50)
+```
+
+```{r}
+out_list <- lapply(ora_results, \(x) {x@result %>% filter(p.adjust < 0.05)})
+saveRDS(out_list, file=paste(output_dir, analysis_name, "_ora_ever_pregnant.rds", sep=""))
+```
+
+### Age
+
+#### Menstrual
+
+```{r}
+top <- top_age[["men"]] %>% arrange(P.Value)
+```
+
+```{r}
+ora_results <- run_ora_top_n(top,
+  run_kegg=TRUE, run_reactome=FALSE, n=100)
+```
+
+```{r}
+sapply(ora_results, function(x) {
+  a <- x@result %>% filter(p.adjust < 0.05) %>% nrow
+  b <- x@geneSets %>% length
+  sprintf("%d/%d", a, b)
+})
+```
+
+```{r}
+ora_results$up_go@result %>% filter(p.adjust < 0.05) %>% arrange(pvalue) %>% head(50)
+```
+
+```{r}
+ora_results$down_go@result %>% filter(p.adjust < 0.05) %>% head(50)
+```
+
+```{r}
+ora_results$up_kegg@result %>% filter(p.adjust < 0.05) %>% head(50)
+```
+
+```{r}
+ora_results$down_kegg@result %>% filter(p.adjust < 0.05) %>% head(50)
+```
+
+```{r}
+out_list <- lapply(ora_results, \(x) {x@result %>% filter(p.adjust < 0.05)})
+saveRDS(out_list, file=paste(output_dir, analysis_name, "_ora_age_men.rds", sep=""))
+```
+
+#### Proliferative
+
+```{r}
+top <- top_age[["pro"]] %>% arrange(P.Value)
+```
+
+```{r}
+ora_results <- run_ora_top_n(top,
+  run_kegg=TRUE, run_reactome=FALSE, n=100)
+```
+
+```{r}
+sapply(ora_results, function(x) {
+  a <- x@result %>% filter(p.adjust < 0.05) %>% nrow
+  b <- x@geneSets %>% length
+  sprintf("%d/%d", a, b)
+})
+```
+
+```{r}
+ora_results$up_go@result %>% filter(p.adjust < 0.05) %>% head(50)
+```
+
+```{r}
+ora_results$down_go@result %>% filter(p.adjust < 0.05) %>% head(50)
+```
+
+```{r}
+ora_results$up_kegg@result %>% filter(p.adjust < 0.05) %>% head(50)
+```
+
+```{r}
+ora_results$down_kegg@result %>% filter(p.adjust < 0.05) %>% head(50)
+```
+
+
+```{r}
+out_list <- lapply(ora_results, \(x) {x@result %>% filter(p.adjust < 0.05)})
+saveRDS(out_list, file=paste(output_dir, analysis_name, "_ora_age_pro.rds", sep=""))
+```
+
+#### Secretory
+
+```{r}
+top <- top_age[["sec"]] %>% arrange(P.Value)
+```
+
+```{r}
+ora_results <- run_ora_top_n(top,
+  run_kegg=TRUE, run_reactome=FALSE, n=100)
+```
+
+```{r}
+sapply(ora_results, function(x) {
+  a <- x@result %>% filter(p.adjust < 0.05) %>% nrow
+  b <- x@geneSets %>% length
+  sprintf("%d/%d", a, b)
+})
+```
+
+
+```{r}
+ora_results$up_go@result %>% filter(p.adjust < 0.05) %>% head(50)
+```
+
+```{r}
+ora_results$down_go@result %>% filter(p.adjust < 0.05) %>% head(50)
+```
+
+```{r}
+ora_results$up_kegg@result %>% filter(p.adjust < 0.05) %>% head(50)
+```
+
+```{r}
+ora_results$down_kegg@result %>% filter(p.adjust < 0.05) %>% head(50)
+```
+
+
+
+```{r}
+out_list <- lapply(ora_results, \(x) {x@result %>% filter(p.adjust < 0.05)})
+saveRDS(out_list, file=paste(output_dir, analysis_name, "_ora_age_sec.rds", sep=""))
+```
+
+
+## Full cycle
+
+```{r}
+top <- topTable(fit, coef="age_scaled", n=Inf)
+```
+
+```{r}
+ora_results <- run_ora_top_n(top,
+  run_kegg=TRUE, run_reactome=FALSE, n=100)
+```
+
+```{r}
+sapply(ora_results, function(x) {
+  a <- x@result %>% filter(p.adjust < 0.05) %>% nrow
+  b <- x@geneSets %>% length
+  sprintf("%d/%d", a, b)
+})
+```
+
+```{r}
+ora_results$up_go@result %>% filter(p.adjust < 0.05) %>% head(50)
+```
+
+```{r}
+ora_results$down_go@result %>% filter(p.adjust < 0.05) %>% head(50)
+```
+
+```{r}
+ora_results$up_kegg@result %>% filter(p.adjust < 0.05) %>% head(50)
+```
+
+```{r}
+ora_results$down_kegg@result %>% filter(p.adjust < 0.05) %>% head(50)
+```
+
+-----
+
+# Session Info
+
+```{r}
+if (nzchar(system.file(package="devtools"))) {
+  devtools::session_info()
+} else {
+  sessionInfo()
+}
+```
+
+
